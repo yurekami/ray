@@ -49,6 +49,7 @@ from ray.data._internal.execution.streaming_executor import (
 )
 from ray.data._internal.execution.streaming_executor_state import (
     OpBufferQueue,
+    OpDisplayMetrics,
     OpState,
     build_streaming_topology,
     get_eligible_operators,
@@ -349,6 +350,170 @@ def test_get_eligible_operators_to_run(ray_start_regular_shared):
 
             # To ensure liveness back-pressure limits will be ignored
             assert _get_eligible_ops_to_run_with_policy(ensure_liveness=True) == [o2]
+
+
+def test_backpressure_policy_tracking(ray_start_regular_shared):
+    """Test that backpressure policies that triggered are tracked correctly."""
+    opts = ExecutionOptions()
+    inputs = make_ref_bundles([[x] for x in range(1)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: block),
+        o1,
+        DataContext.get_current(),
+        name="O2",
+    )
+    topo = build_streaming_topology(o2, opts)
+
+    # Add input to o2's input queue so it becomes eligible
+    topo[o1].output_queue.append(make_ref_bundle("dummy1"))
+
+    # Create mock backpressure policies
+    class MockPolicy1:
+        def can_add_input(self, op):
+            return op is not o2  # Block o2
+
+        def max_task_output_bytes_to_read(self, op):
+            return None
+
+    class MockPolicy2:
+        def can_add_input(self, op):
+            return True  # Allow all
+
+        def max_task_output_bytes_to_read(self, op):
+            return None
+
+    class MockPolicy3:
+        def can_add_input(self, op):
+            return op is not o2  # Block o2
+
+        def max_task_output_bytes_to_read(self, op):
+            return None
+
+    policies = [MockPolicy1(), MockPolicy2(), MockPolicy3()]
+
+    # Call get_eligible_operators which should track triggered policies
+    get_eligible_operators(topo, policies, ensure_liveness=False)
+
+    # Check that o2 has the correct policies tracked
+    assert o2._in_task_submission_backpressure is True
+    assert "MockPolicy1" in o2._task_submission_backpressure_policies
+    assert "MockPolicy2" not in o2._task_submission_backpressure_policies
+    assert "MockPolicy3" in o2._task_submission_backpressure_policies
+
+    # Now test with no backpressure
+    class AllowAllPolicy:
+        def can_add_input(self, op):
+            return True
+
+        def max_task_output_bytes_to_read(self, op):
+            return None
+
+    get_eligible_operators(topo, [AllowAllPolicy()], ensure_liveness=False)
+
+    # Check that o2 is no longer in backpressure
+    assert o2._in_task_submission_backpressure is False
+    assert o2._task_submission_backpressure_policies == []
+
+
+def test_output_backpressure_policy_tracking(ray_start_regular_shared):
+    """Test that output backpressure policies are tracked correctly."""
+    opts = ExecutionOptions()
+    inputs = make_ref_bundles([[x] for x in range(1)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: block),
+        o1,
+        DataContext.get_current(),
+        name="O2",
+    )
+    topo = build_streaming_topology(o2, opts)
+
+    # Create mock backpressure policies for output limiting
+    class LimitingPolicy:
+        def can_add_input(self, op):
+            return True
+
+        def max_task_output_bytes_to_read(self, op):
+            return 0 if op is o2 else None  # Block o2 output
+
+    class NonLimitingPolicy:
+        def can_add_input(self, op):
+            return True
+
+        def max_task_output_bytes_to_read(self, op):
+            return 1000  # Allow some output
+
+    class NoLimitPolicy:
+        def can_add_input(self, op):
+            return True
+
+        def max_task_output_bytes_to_read(self, op):
+            return None  # No limit
+
+    policies = [LimitingPolicy(), NonLimitingPolicy(), NoLimitPolicy()]
+
+    # Call process_completed_tasks which tracks output policies
+    process_completed_tasks(topo, policies, max_errored_blocks=0)
+
+    # Check that o2 has output backpressure with correct policy
+    assert o2._in_task_output_backpressure is True
+    assert "LimitingPolicy" in o2._task_output_backpressure_policies
+    assert "NonLimitingPolicy" not in o2._task_output_backpressure_policies
+    assert "NoLimitPolicy" not in o2._task_output_backpressure_policies
+
+    # Now test with no output backpressure
+    process_completed_tasks(topo, [NonLimitingPolicy()], max_errored_blocks=0)
+
+    # Check that o2 is no longer in output backpressure
+    assert o2._in_task_output_backpressure is False
+    assert o2._task_output_backpressure_policies == []
+
+
+def test_op_display_metrics_backpressure_policies():
+    """Test that OpDisplayMetrics correctly displays backpressure policy names."""
+    # Test with no backpressure
+    metrics = OpDisplayMetrics(tasks=5)
+    display = metrics.display_str()
+    assert "backpressured" not in display
+
+    # Test with task backpressure but no policy names
+    metrics = OpDisplayMetrics(tasks=5, task_backpressured=True)
+    display = metrics.display_str()
+    assert "[backpressured: tasks]" in display
+
+    # Test with task backpressure and policy names
+    metrics = OpDisplayMetrics(
+        tasks=5,
+        task_backpressured=True,
+        task_backpressure_policies=[
+            "ConcurrencyCapBackpressurePolicy",
+            "ResourceBudgetBackpressurePolicy",
+        ],
+    )
+    display = metrics.display_str()
+    assert "[backpressured: tasks(ConcurrencyCap,ResourceBudget)]" in display
+
+    # Test with output backpressure and policy names
+    metrics = OpDisplayMetrics(
+        tasks=5,
+        output_backpressured=True,
+        output_backpressure_policies=["ResourceBudgetBackpressurePolicy"],
+    )
+    display = metrics.display_str()
+    assert "[backpressured: outputs(ResourceBudget)]" in display
+
+    # Test with both task and output backpressure with policy names
+    metrics = OpDisplayMetrics(
+        tasks=5,
+        task_backpressured=True,
+        task_backpressure_policies=["DownstreamCapacityBackpressurePolicy"],
+        output_backpressured=True,
+        output_backpressure_policies=["ResourceBudgetBackpressurePolicy"],
+    )
+    display = metrics.display_str()
+    assert "tasks(DownstreamCapacity)" in display
+    assert "outputs(ResourceBudget)" in display
 
 
 def test_rank_operators(ray_start_regular_shared):

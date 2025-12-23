@@ -189,8 +189,20 @@ class OpDisplayMetrics:
     actors: int = 0
     queued: int = 0
     task_backpressured: bool = False
+    task_backpressure_policies: List[str] = None
     output_backpressured: bool = False
+    output_backpressure_policies: List[str] = None
     extra_info: str = ""
+
+    def __post_init__(self):
+        if self.task_backpressure_policies is None:
+            self.task_backpressure_policies = []
+        if self.output_backpressure_policies is None:
+            self.output_backpressure_policies = []
+
+    def _format_policy_names(self, policies: List[str]) -> str:
+        """Format policy names by removing the 'BackpressurePolicy' suffix."""
+        return ",".join(p.replace("BackpressurePolicy", "") for p in policies)
 
     def display_str(self) -> str:
         """Format metrics object to a displayable string."""
@@ -204,9 +216,23 @@ class OpDisplayMetrics:
         if self.task_backpressured or self.output_backpressured:
             backpressured = []
             if self.task_backpressured:
-                backpressured.append("tasks")
+                # Show which policies triggered task backpressure
+                if self.task_backpressure_policies:
+                    policy_names = self._format_policy_names(
+                        self.task_backpressure_policies
+                    )
+                    backpressured.append(f"tasks({policy_names})")
+                else:
+                    backpressured.append("tasks")
             if self.output_backpressured:
-                backpressured.append("outputs")
+                # Show which policies triggered output backpressure
+                if self.output_backpressure_policies:
+                    policy_names = self._format_policy_names(
+                        self.output_backpressure_policies
+                    )
+                    backpressured.append(f"outputs({policy_names})")
+                else:
+                    backpressured.append("outputs")
             task_str += f" [backpressured: {','.join(backpressured)}]"
         if self.extra_info:
             task_str += f": {self.extra_info}"
@@ -343,8 +369,14 @@ class OpState:
         self.op_display_metrics.task_backpressured = (
             self.op._in_task_submission_backpressure
         )
+        self.op_display_metrics.task_backpressure_policies = (
+            self.op._task_submission_backpressure_policies
+        )
         self.op_display_metrics.output_backpressured = (
             self.op._in_task_output_backpressure
+        )
+        self.op_display_metrics.output_backpressure_policies = (
+            self.op._task_output_backpressure_policies
         )
 
         self.op_display_metrics.extra_info = self.op.progress_str()
@@ -552,16 +584,20 @@ def process_completed_tasks(
         # Check all backpressure policies for max_task_output_bytes_to_read
         # Use the minimum limit from all policies (most restrictive)
         max_bytes_to_read = None
+        # Track which policies are limiting output (returning 0 bytes)
+        limiting_policies = []
         for policy in backpressure_policies:
             policy_limit = policy.max_task_output_bytes_to_read(op)
             if policy_limit is not None:
+                if policy_limit == 0:
+                    limiting_policies.append(type(policy).__name__)
                 if max_bytes_to_read is None:
                     max_bytes_to_read = policy_limit
                 else:
                     max_bytes_to_read = min(max_bytes_to_read, policy_limit)
 
         # If no policy provides a limit, there's no limit
-        op.notify_in_task_output_backpressure(max_bytes_to_read == 0)
+        op.notify_in_task_output_backpressure(max_bytes_to_read == 0, limiting_policies)
         if max_bytes_to_read is not None:
             max_bytes_to_read_per_op[state] = max_bytes_to_read
 
@@ -704,8 +740,12 @@ def get_eligible_operators(
 
     for op, state in topology.items():
         # Operator is considered being in task-submission back-pressure if any
-        # back-pressure policy is violated
-        in_backpressure = any(not p.can_add_input(op) for p in backpressure_policies)
+        # back-pressure policy is violated.
+        # Track which backpressure policies are triggered for this operator
+        triggered_policies = [
+            type(p).__name__ for p in backpressure_policies if not p.can_add_input(op)
+        ]
+        in_backpressure = len(triggered_policies) > 0
 
         op_runnable = False
 
@@ -727,8 +767,7 @@ def get_eligible_operators(
         )
 
         # Signal whether op in backpressure for stats collections
-        # TODO(hchen): also report which policy triggers backpressure.
-        op.notify_in_task_submission_backpressure(in_backpressure)
+        op.notify_in_task_submission_backpressure(in_backpressure, triggered_policies)
 
     # To ensure liveness, allow at least 1 operator to schedule tasks regardless of
     # limits in case when topology is entirely idle (no active tasks running)
